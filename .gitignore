@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+build/
+dist/
+dist_installer/
+models/
+assets/icon.ico
+assets/icon.png
+*.log
+.venv/
