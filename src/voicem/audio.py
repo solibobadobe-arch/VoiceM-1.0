@@ -16,9 +16,15 @@ except Exception:  # pragma: no cover
 class Recorder:
     """Пишет моно 16 kHz float32 и отдаёт уровень громкости для полоски волн."""
 
-    def __init__(self, sample_rate: int = 16000, on_level: Callable[[float], None] | None = None):
+    def __init__(
+        self,
+        sample_rate: int = 16000,
+        on_level: Callable[[float], None] | None = None,
+        device: int | None = None,
+    ):
         self.sample_rate = sample_rate
         self.on_level = on_level
+        self.device = device
         self._chunks: list[np.ndarray] = []
         self._queue: "queue.Queue[np.ndarray]" = queue.Queue()
         self._stream = None
@@ -44,13 +50,16 @@ class Recorder:
             while not self._queue.empty():
                 self._queue.get_nowait()
             try:
-                self._stream = sd.InputStream(
-                    samplerate=self.sample_rate,
-                    channels=1,
-                    dtype="float32",
-                    blocksize=1024,
-                    callback=self._callback,
-                )
+                kwargs = {
+                    "samplerate": self.sample_rate,
+                    "channels": 1,
+                    "dtype": "float32",
+                    "blocksize": 1024,
+                    "callback": self._callback,
+                }
+                if self.device is not None:
+                    kwargs["device"] = self.device
+                self._stream = sd.InputStream(**kwargs)
                 self._stream.start()
             except Exception as exc:  # микрофон занят/не найден
                 self.error = f"Микрофон недоступен: {exc}"

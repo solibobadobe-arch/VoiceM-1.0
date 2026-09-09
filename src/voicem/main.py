@@ -9,13 +9,14 @@ from PySide6.QtCore import QObject, Qt, Signal
 from PySide6.QtGui import QAction, QColor, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import QApplication, QMenu, QMessageBox, QSystemTrayIcon
 
-from . import theme
+from . import system_access, theme
 from .audio import Recorder
-from .config import config_path, load_config, log_path, model_dir, save_config
+from .config import load_config, log_path, model_dir, save_config
 from .hotkey import HotkeyListener
 from .inserter import insert_text
 from .overlay import WaveOverlay
 from .transcribe import Transcriber
+from .window import MainWindow
 
 
 def setup_logging() -> None:
@@ -36,6 +37,7 @@ class Bridge(QObject):
     finished = Signal(str)
     failed = Signal(str)
     cancelled = Signal()
+    model_ready = Signal(bool, str)
 
 
 def app_icon() -> QIcon:
@@ -63,8 +65,16 @@ class VoiceMApp:
         self.recorder = Recorder(
             sample_rate=int(self.cfg.get("sample_rate", 16000)),
             on_level=self.bridge.level.emit,
+            device=self.cfg.get("input_device"),
         )
         self.busy = False
+
+        # главное окно с бургер-меню
+        self.window = MainWindow(self.cfg)
+        self.window.setWindowIcon(app_icon())
+        self.window.settings_changed.connect(self._on_settings_changed)
+        self.window.hotkey_changed.connect(self._rebind_hotkey)
+        self.window.request_quit.connect(self._quit)
 
         self.bridge.started.connect(self._on_started)
         self.bridge.level.connect(self.overlay.set_level)
@@ -72,10 +82,12 @@ class VoiceMApp:
         self.bridge.finished.connect(self._on_finished)
         self.bridge.failed.connect(self._on_failed)
         self.bridge.cancelled.connect(self._on_cancelled)
+        self.bridge.model_ready.connect(self.window.set_model_state)
 
         self.tray = QSystemTrayIcon(app_icon(), app)
         self.tray.setToolTip(self._tooltip())
         self.tray.setContextMenu(self._menu())
+        self.tray.activated.connect(self._on_tray_activated)
         self.tray.show()
 
         self.listener = HotkeyListener(
@@ -99,31 +111,22 @@ class VoiceMApp:
         menu = QMenu()
         menu.setStyleSheet(theme.QSS)
 
+        open_action = QAction("Открыть VoiceM", menu)
+        open_action.triggered.connect(self._show_window)
+        menu.addAction(open_action)
+
+        settings_action = QAction("Настройки", menu)
+        settings_action.triggered.connect(lambda: self._show_window("recognition"))
+        menu.addAction(settings_action)
+
+        access_action = QAction("Доступы Windows", menu)
+        access_action.triggered.connect(lambda: self._show_window("access"))
+        menu.addAction(access_action)
+
+        menu.addSeparator()
         info = QAction(f"Клавиша: {self.cfg.get('hotkey')}", menu)
         info.setEnabled(False)
         menu.addAction(info)
-        menu.addSeparator()
-
-        mode_action = QAction(
-            "Режим: удержание" if self.cfg.get("mode") == "hold" else "Режим: переключение",
-            menu,
-        )
-        mode_action.setEnabled(False)
-        menu.addAction(mode_action)
-
-        fillers = QAction("Убирать слова-паразиты", menu)
-        fillers.setCheckable(True)
-        fillers.setChecked(bool(self.cfg.get("remove_fillers", True)))
-        fillers.triggered.connect(self._toggle_fillers)
-        menu.addAction(fillers)
-
-        settings = QAction("Открыть файл настроек", menu)
-        settings.triggered.connect(self._open_settings)
-        menu.addAction(settings)
-
-        about = QAction("О программе", menu)
-        about.triggered.connect(self._about)
-        menu.addAction(about)
 
         menu.addSeparator()
         quit_action = QAction("Выход", menu)
@@ -131,46 +134,74 @@ class VoiceMApp:
         menu.addAction(quit_action)
         return menu
 
-    def _toggle_fillers(self, checked: bool) -> None:
-        self.cfg["remove_fillers"] = bool(checked)
-        save_config(self.cfg)
+    def _on_tray_activated(self, reason) -> None:  # noqa: ANN001
+        if reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick):
+            self._show_window()
 
-    def _open_settings(self) -> None:
-        import os
+    def _show_window(self, page: str | None = None) -> None:
+        if page:
+            self.window.show_page(page)
+        self.window.show()
+        self.window.raise_()
+        self.window.activateWindow()
+        self.window.refresh_access()
 
-        path = config_path()
-        if not path.exists():
-            save_config(self.cfg)
+    def _on_settings_changed(self, changes: dict) -> None:
+        if "input_device" in changes:
+            self.recorder.device = changes["input_device"]
+        if "model" in changes or "language" in changes or "compute_type" in changes:
+            self.transcriber.cfg = self.cfg
+
+    def _rebind_hotkey(self, hotkey: str, mode: str) -> None:
         try:
-            os.startfile(str(path))  # noqa: S606
+            self.listener.stop()
         except Exception:
             pass
-
-    def _about(self) -> None:
-        box = QMessageBox()
-        box.setStyleSheet(theme.QSS)
-        box.setWindowTitle("VoiceM")
-        box.setText(
-            "VoiceM 1.0.0\n\n"
-            "Голосовой ввод в любое поле ввода.\n"
-            f"Горячая клавиша: {self.cfg.get('hotkey')}\n"
-            "Распознавание работает локально, без интернета."
+        self.listener = HotkeyListener(
+            hotkey=hotkey or "right alt",
+            mode=mode or "hold",
+            on_start=self._start_recording,
+            on_stop=self._stop_recording,
+            on_cancel=self._cancel_recording,
         )
-        box.exec()
+        if self.listener.start():
+            self.window.set_status(f"Горячая клавиша: {hotkey.upper()}")
+        else:
+            self.window.set_status(self.listener.error or "Не удалось переназначить клавишу")
+        self.tray.setToolTip(self._tooltip())
+        self.tray.setContextMenu(self._menu())
 
     def _quit(self) -> None:
-        self.listener.stop()
+        try:
+            self.listener.stop()
+        except Exception:
+            pass
         self.overlay.hide_overlay()
         self.tray.hide()
+        self.cfg["close_to_tray"] = self.cfg.get("close_to_tray", True)
+        save_config(self.cfg)
         self.app.quit()
 
     def _warm_up(self) -> None:
         if model_dir(self.cfg) is None:
             self.bridge.failed.emit("Модель не найдена — переустановите VoiceM")
+            self.bridge.model_ready.emit(False, "Модель не найдена — переустановите VoiceM")
             return
-        self.transcriber.load()
+        ok = self.transcriber.load()
+        if ok is False:
+            self.bridge.model_ready.emit(
+                False, self.transcriber.last_error or "Модель не загрузилась"
+            )
+            return
+        self.bridge.model_ready.emit(
+            True,
+            f"Модель распознавания готова: {self.cfg.get('model', 'small')} • локально, без интернета",
+        )
 
     # -- запись -------------------------------------------
+    def _overlay_enabled(self) -> bool:
+        return bool(self.cfg.get("show_overlay", True))
+
     def _start_recording(self) -> None:
         if self.busy:
             return
@@ -217,21 +248,31 @@ class VoiceMApp:
 
     # -- UI-реакции --------------------------------------
     def _on_started(self) -> None:
-        self.overlay.show_state("recording")
+        if self._overlay_enabled():
+            self.overlay.show_state("recording")
+        self.window.set_status("Запись…")
 
     def _on_processing(self) -> None:
-        self.overlay.show_state("processing")
+        if self._overlay_enabled():
+            self.overlay.show_state("processing")
+        self.window.set_status("Распознаю…")
 
     def _on_finished(self, text: str) -> None:
         preview = text if len(text) <= 60 else text[:57] + "…"
-        self.overlay.show_state("done", preview, auto_hide_ms=1200)
+        if self._overlay_enabled():
+            self.overlay.show_state("done", preview, auto_hide_ms=1200)
+        self.window.set_status("Готово")
+        self.window.add_history(text)
 
     def _on_failed(self, message: str) -> None:
         logging.error(message)
-        self.overlay.show_state("error", message, auto_hide_ms=3500)
+        if self._overlay_enabled():
+            self.overlay.show_state("error", message, auto_hide_ms=3500)
+        self.window.set_status(message)
 
     def _on_cancelled(self) -> None:
         self.overlay.hide_overlay()
+        self.window.set_status("Запись отменена")
 
     def run(self) -> int:
         if not self.listener.start():
@@ -240,8 +281,21 @@ class VoiceMApp:
             box.setWindowTitle("VoiceM")
             box.setText(self.listener.error or "Не удалось запустить горячую клавишу")
             box.exec()
-            return 1
-        self.overlay.show_state("done", "VoiceM запущен", auto_hide_ms=1800)
+
+        self.cfg["autostart"] = system_access.autostart_enabled()
+        save_config(self.cfg)
+        self.window.refresh_access()
+
+        start_hidden = bool(self.cfg.get("start_minimized", False)) and bool(
+            self.cfg.get("seen_welcome", False)
+        )
+        if start_hidden:
+            if self._overlay_enabled():
+                self.overlay.show_state("done", "VoiceM запущен", auto_hide_ms=1800)
+        else:
+            self.window.show()
+            self.cfg["seen_welcome"] = True
+            save_config(self.cfg)
         return self.app.exec()
 
 
@@ -250,5 +304,6 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("VoiceM")
     app.setQuitOnLastWindowClosed(False)
+    app.setWindowIcon(app_icon())
     app.setStyleSheet(theme.QSS)
     return VoiceMApp(app).run()
