@@ -24,6 +24,14 @@ DEFAULTS = {
     "min_seconds": 0.35,
     "max_seconds": 120,
     "sound_feedback": False,
+    # —— настройки окна и системы (1.1.0) ——
+    "input_device": None,  # None = устройство по умолчанию
+    "show_overlay": True,
+    "close_to_tray": True,
+    "keep_history": True,
+    "start_minimized": False,
+    "autostart": False,
+    "seen_welcome": False,
 }
 
 
