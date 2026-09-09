@@ -1,6 +1,6 @@
 ; Установщик VoiceM (Inno Setup 6)
 #define MyAppName "VoiceM"
-#define MyAppVersion "1.0.0"
+#define MyAppVersion "1.1.0"
 #define MyAppPublisher "VoiceM"
 #define MyAppExeName "VoiceM.exe"
 
